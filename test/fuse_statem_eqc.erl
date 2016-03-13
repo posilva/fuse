@@ -1,11 +1,14 @@
 %%% The fuse_eqc module implements a Quickcheck model for the Fuse main gen_server.
--module(fuse_eqc).
+-module(fuse_statem_eqc).
 -compile(export_all).
 
 -ifdef(EQC_TESTING).
 
 -include_lib("eqc/include/eqc.hrl").
--include_lib("eqc/include/eqc_component.hrl").
+-include_lib("eqc/include/eqc_statem.hrl").
+
+-include_lib("pulse/include/pulse.hrl").
+-include_lib("pulse_otp/include/pulse_otp.hrl").
 
 %%% Model state.
 -record(state, {
@@ -19,32 +22,7 @@
 
 -define(CONTEXT, sync).
 
-%% -- MOCKING ------------------------------------------------
-
-api_spec() ->
-    #api_spec {
-        language = erlang,
-        modules = [
-            #api_module {
-                name = fuse_rand,
-                functions = [#api_fun { name = uniform, arity = 0 } ]
-    }]}.
-
 %% API Generators
-
--define(Q, 10000000000000000000).
--define(EPSILON, 0.000001).
-
-g_uniform_real() ->
-    ?LET(K, choose(1,?Q-1), K / ?Q).
-
-g_split_float(Pivot) ->
-   frequency([
-       {10, g_uniform_real() },
-       {10, Pivot - ?EPSILON },
-       {10, Pivot + ?EPSILON }
-   ]).
-
 
 %% fuses/0 is the list of fuses we support in the model for testing purposes.
 fuses() -> [phineas, ferb, candace, isabella, vanessa, perry, heinz].
@@ -64,7 +42,7 @@ g_disabled_name(S) ->
 %% Thomas says this is a bad idea, since we can rule out the name by a precondition (_pre/3)
 %% As a result we stopped using functions like these.
 %% g_installed(S) ->
-%%    fault(g_name(), oneof(installed_names(S))).
+%%	fault(g_name(), oneof(installed_names(S))).
 
 %% g_neg_int/0 Generates a negative integer, or 0
 g_neg_int() ->
@@ -75,17 +53,13 @@ g_neg_int() ->
 %% reject incorrect strategies.
 g_strategy() ->
     fault(
-        {frequency([
-            {1, {g_atom(), int(), int()}},
-            {1, {standard, g_neg_int(), int()}},
-            {1, {standard, int(), g_neg_int()}},
-            {1, {standard, int(), int()}},
-            {1, {fault_injection, oneof([real(), int(), g_atom()]), int(), int()}}
-        ])},
-        oneof([
-            {standard, choose(1, 2), choose(1, 3)},
-            {fault_injection, g_uniform_real(), choose(1,2), choose(1,3)}
-        ])
+    	{frequency([
+    		{1, {g_atom(), int(), int()}},
+    		{1, {standard, g_neg_int(), int()}},
+    		{1, {standard, int(), g_neg_int()}},
+    		{1, {standard, int(), int()}}
+    	])},
+    	{standard, choose(1, 2), choose(1, 3)}
     ).
 
 %% g_refresh()/0 generates a refresh setting.
@@ -164,10 +138,10 @@ fuse_reset_return(_S, [_Name]) -> ok.
 %% ---------------------------------------------------------------
 install(Name, Opts) ->
     try fuse:install(Name, Opts) of
-        ok -> ok
+    	ok -> ok
     catch
-        error:badarg ->
-            badarg
+    	error:badarg ->
+    		badarg
     end.
 
 install_args(_S) ->
@@ -179,7 +153,8 @@ install_next(#state{ installed = Is } = S, _V, [Name, Opts]) ->
     case valid_opts(Opts) of
         false -> S;
         true ->
-            T = {Name, parse_opts(Opts)},
+            {{standard, Count, Period}, _} = Opts,
+            T = {Name, Count, Period},
             clear_melts(Name,
                 clear_blown(Name,
                     S#state { installed = lists:keystore(Name, 1, Is, T) }))
@@ -189,12 +164,8 @@ install_features(S, [Name, Opts], _R) ->
     case valid_opts(Opts) of
         false -> [{fuse_eqc, r03, installing_invalid_fuse}];
         true ->
-            case Opts of
-                {{standard, Count, Period}, _} ->
-                    [{fuse_eqc, r03, {installing_fuse, Count, Period, {new, is_installed(Name, S)}}}];
-                {{fault_injection, _, Count, Period}, _} ->
-                    [{fuse_eqc, r03, {installing_fuse, Count, Period, {new, is_installed(Name, S)}}}]
-            end
+            {{standard, Count, Period}, _} = Opts,
+            [{fuse_eqc, r03, {installing_fuse, Count, Period, {new, is_installed(Name, S)}}}]
     end.
 
 install_return(_S, [_Name, Opts]) ->
@@ -310,8 +281,6 @@ reset_features(S, [Name], _V) ->
 %%% ask/1 asks about the state of a fuse that exists
 %% ---------------------------------------------------------------
 %% Split into two variants
-
-%% ask/1 on a fuse which is known to be installed
 ask_installed(Name) ->
     fuse:ask(Name, ?CONTEXT).
 
@@ -324,11 +293,12 @@ ask_installed_pre(S, [Name]) -> is_installed(Name, S).
 ask_installed_features(_S, [_Name], _R) ->
     [{fuse_eqc, r15, ask_installed}].
 
-ask_installed_callouts(_S, [Name]) ->
-    ?MATCH(Res, ?APPLY(lookup, [Name])),
-    ?RET(Res).
+ask_installed_return(S, [Name]) ->
+    case is_blown(Name, S) orelse is_disabled(Name, S) of
+    	true -> blown;
+    	false -> ok
+    end.
 
-%% plain ask/1
 ask(Name) ->
     fuse:ask(Name, ?CONTEXT).
 
@@ -336,34 +306,21 @@ ask_pre(S) -> has_fuses_installed(S).
 
 ask_args(_S) -> [g_name()].
 
-ask_callouts(_S, [Name]) ->
-    ?MATCH(Res, ?APPLY(lookup, [Name])),
-    ?RET(Res).
-
 ask_features(S, [Name], _V) ->
     case is_installed(Name, S) of
        true -> [{fuse_eqc, r15, ask_installed}];
        false -> [{fuse_eqc, r16, ask_uninstalled}]
     end.
 
-%% -- LOOKUP FUSE STATE (Internal) --------------------------------------------------------
-
-lookup_callouts(S, [Name]) ->
-    case lookup_fuse(Name, S) of
-        not_found ->
-            ?RET({error, not_found});
-        {_, disabled} ->
-            ?RET(blown);
-        {_, blown} ->
-            ?RET(blown);
-        {standard, ok} ->
-            ?RET(ok);
-        {fault_injection, {gradual, X}} ->
-            ?MATCH(Rand, ?CALLOUT(fuse_rand, uniform, [], g_split_float(X))),
-            case Rand < X of
-                true -> ?RET(blown);
-                false -> ?RET(ok)
-            end
+ask_return(S, [Name]) ->
+    case is_installed(Name, S) of
+        true ->
+            case is_blown(Name, S) orelse is_disabled(Name, S) of
+                true -> blown;
+                false -> ok
+            end;
+        false ->
+            {error, not_found}
     end.
 
 %%% run/1 runs a function (thunk) on the circuit breaker
@@ -378,30 +335,23 @@ run_args(_S) ->
     ?LET({N, Result, Return}, {g_name(), elements([ok, melt]), int()},
         [N, Result, Return, function0({Result, Return})] ).
 
-run_callouts(_S, [Name, Result, Return, _Fun]) ->
-    ?MATCH(Res, ?APPLY(lookup, [Name])),
-    case Res of
-        {error, not_found} ->
-            ?RET({error, not_found});
-        blown ->
-            ?RET(blown);
-        ok ->
-            ?APPLY(run_melt, [Name, Result]),
-            ?RET({ok, Return})
+run_next(S, _V, [_Name, ok, _, _]) -> S;
+run_next(#state { time = Ts } = S, _V, [Name, melt, _, _]) ->
+    case is_installed(Name, S) of
+            true ->
+                case is_blown(Name, S) of
+                    true -> S;
+                    false ->
+                        M = val(record_melt(Name, Ts, S)),
+                        {_, NewState} =
+                          bind(M, fun(S2) ->
+                          bind(expire_melts(period(Name, S2), Name, S2), fun(S3) ->
+                            record_melt_history(Name, S3) end) end),
+                        NewState
+                end;
+            false -> S
     end.
 
-%% Track melting of fuses
-run_melt_next(S, _V, [_Name, ok]) -> S;
-run_melt_next(#state{ time = Ts } = S, _V, [Name, melt]) ->
-    M = val(record_melt(Name, Ts, S)),
-    {_, NewState} = 
-        bind(M, fun(S2) ->
-        bind(expire_melts(fuse_period(Name, S2), Name, S2), fun(S3) ->
-            record_melt_history(Name, S3) end) end),
-    NewState.
-
-%% TODO: Fold this into the underlying helper functions
-%% of run_melt and lookup. This yields a simpler model.
 run_features(_S, [_Name, ok, _, _], _R) -> [{fuse_eqc, r07, run_ok_fuse}];
 run_features(#state { time = Ts } = S, [Name, melt, _, _], _R) ->
   case is_installed(Name, S) of
@@ -416,13 +366,25 @@ run_features(#state { time = Ts } = S, [Name, melt, _, _], _R) ->
            M = val(record_melt(Name, Ts, S)),
            {Features, _} =
              bind(M, fun(S2) ->
-             bind(expire_melts(fuse_period(Name, S2), Name, S2), fun(S3) ->
+             bind(expire_melts(period(Name, S2), Name, S2), fun(S3) ->
                record_melt_history(Name, S3) end) end),
            Disables ++ Features ++ [{fuse_eqc, r09, run_melt_on_installed_fuse}]
       end;
     false ->
       [{fuse_eqc, r10, run_on_uninstalled_fuse}]
   end.
+
+run_return(S, [Name, _Result, Return, _]) ->
+    case is_installed(Name, S) of
+        true ->
+    	case is_blown(Name, S) orelse is_disabled(Name, S) of
+    	    false -> {ok, Return};
+    	    true -> blown
+    	end;
+        false ->
+            {error, not_found}
+    end.
+
 
 %%% melt/1 melts the fuse a little bit
 %% ---------------------------------------------------------------
@@ -443,7 +405,7 @@ melt_installed_next(#state { time = Ts } = S, _V, [Name]) ->
     M = val(record_melt(Name, Ts, S)),
     {_, NewState} =
       bind(M, fun(S2) ->
-      bind(expire_melts(fuse_period(Name, S2), Name, S2), fun(S3) ->
+      bind(expire_melts(period(Name, S2), Name, S2), fun(S3) ->
         record_melt_history(Name, S3) end) end),
     NewState.
 
@@ -451,7 +413,7 @@ melt_installed_features(#state { time = Ts } = S, [Name], _V) ->
     M = val(record_melt(Name, Ts, S)),
     {Features, _} =
       bind(M, fun(S2) ->
-      bind(expire_melts(fuse_period(Name, S2), Name, S2), fun(S3) ->
+      bind(expire_melts(period(Name, S2), Name, S2), fun(S3) ->
         record_melt_history(Name, S3) end) end),
     [{fuse_eqc, r11, melt_installed_fuse}] ++ Features.
 
@@ -472,7 +434,7 @@ melt_next(#state { time = Ts } = S, _V, [Name]) ->
               M = val(record_melt(Name, Ts, S)),
               {_, NewState} =
                 bind(M, fun(S2) ->
-                bind(expire_melts(fuse_period(Name, S2), Name, S2), fun(S3) ->
+                bind(expire_melts(period(Name, S2), Name, S2), fun(S3) ->
                   record_melt_history(Name, S3) end) end),
               NewState;
             false -> S
@@ -488,7 +450,7 @@ melt_features(#state { time = Ts } = S, [Name], _V) ->
               M = val(record_melt(Name, Ts, S)),
               {Features, _} =
                 bind(M, fun(S2) ->
-                bind(expire_melts(fuse_period(Name, S2), Name, S2), fun(S3) ->
+                bind(expire_melts(period(Name, S2), Name, S2), fun(S3) ->
                   record_melt_history(Name, S3) end) end),
               [{fuse_eqc, r11, melt_installed_fuse}] ++ Features ++ Disabled;
         false -> [{fuse_eqc, r12, melt_uninstalled_fuse}]
@@ -551,12 +513,11 @@ postcondition_common(S, Call, Res) ->
     eq(Res, return_value(S, Call)).
 
 %% Test the stateful system against a random sequential command sequence.
-prop_component() ->
+prop_model_seq() ->
     ?SETUP( fun() ->
-        eqc_mocking:start_mocking(api_spec()),
-        setup(),
-        fun() -> ok end
-    end,
+                    setup(),
+                    fun() -> ok end
+            end,
     fault_rate(1, 40,
     ?FORALL(Cmds, more_commands(2, commands(?MODULE)),
       begin
@@ -570,16 +531,60 @@ prop_component() ->
                 R == ok))))
       end))).
 
-cleanup() ->
-    (catch application:stop(fuse)),
-    {ok, _Apps} = application:ensure_all_started(fuse).
+%% Test the stateful system against a random parallel command sequence with a sequential prefix.
+prop_model_par() ->
+    ?SETUP( fun() ->
+                   setup(),
+                   fun() -> ok end
+           end,
+    fault_rate(1, 40,
+     ?LET(Shrinking, parameter(shrinking, false),
+    ?FORALL(Cmds, more_commands(2, parallel_commands(?MODULE)),
+      ?ALWAYS(if not Shrinking -> 1;
+                     Shrinking -> 20
+    	  end,
+      begin
+              fuse_time_mock:start(-10000),
+              cleanup(),
+              {H, S, R} = run_parallel_commands(?MODULE, Cmds),
+              aggregate(command_names(Cmds),
+                  pretty_commands(?MODULE, Cmds, {H, S, R}, R == ok))
+      end))))).
 
+%% Run a test under PULSE to randomize the process schedule as well.
+x_prop_model_pulse() ->
+   ?SETUP(fun() ->
+                   setup(),
+                   fun() -> ok end
+           end,
+  ?LET(Shrinking, parameter(shrinking, false),
+  ?FORALL(Cmds, more_commands(2, parallel_commands(?MODULE)),
+    ?ALWAYS(if not Shrinking -> 1; Shrinking -> 20 end,
+      ?PULSE(HSR={_, _, R},
+        begin
+          fuse_time_mock:start(-10000),
+          cleanup(),
+          run_parallel_commands(?MODULE, Cmds)
+        end,
+        aggregate(command_names(Cmds),
+        pretty_commands(?MODULE, Cmds, HSR, R == ok))))))).
+
+-ifdef(WITH_PULSE).
+setup() ->
+  error_logger:tty(false),
+  ok.
+-else.
 setup() ->
   error_logger:tty(false),
   application:load(sasl),
   application:set_env(sasl, sasl_error_logger, false),
   application:set_env(sasl, errlog_type, error),
   application:start(sasl).
+-endif.
+
+cleanup() ->
+    (catch application:stop(fuse)),
+    {ok, _Apps} = application:ensure_all_started(fuse).
 
 %%% Helpers
 %%% ---------------------
@@ -595,37 +600,13 @@ is_installed(N, #state { installed = Is }) -> lists:keymember(N, 1, Is).
 
 %% valid_opts/1 determines if the given options are valid
 valid_opts({{standard, K, R}, {reset, T}})
-  when K > 0, R >= 0, T >= 0 ->
-    true;
-valid_opts({{fault_injection, Rate, K, R}, {reset, T}})
-  when K > 0, R >= 0, T >= 0, is_float(Rate), 0 < Rate, Rate =< 1.0 ->
+    when K > 0, R >= 0, T >= 0 ->
     true;
 valid_opts(_) ->
     false.
 
 melt_state(Name, S) ->
     count_state(fuse_intensity(Name, S) - count_melts(Name, S)).
-
-lookup_fuse(Name, #state { installed = Fs } = State) ->
-    case is_disabled(Name, State) of
-        true -> {Name, disabled};
-        false ->
-            case lists:keyfind(Name, 1, Fs) of
-                false -> not_found;
-                {_, #{ fuse_type := standard }} ->
-                    Blown = case is_blown(Name, State) of
-                        true -> blown;
-                        false -> ok
-                    end,
-                    {standard, Blown};
-                {_, #{ fuse_type := fault_injection, rate := Rate }} ->
-                    Blown = case is_blown(Name, State) of
-                        true -> blown;
-                        false -> {gradual, Rate}
-                    end,
-                    {fault_injection, Blown}
-            end
-    end.
 
 is_blown(Name, #state { blown = BlownFuses }) ->
     lists:member(Name, BlownFuses).
@@ -636,12 +617,8 @@ is_disabled(Name, #state { disabled = Ds }) ->
 has_disabled(#state { disabled = Ds }) -> Ds /= [].
 
 fuse_intensity(Name, #state { installed = Inst }) ->
-    {Name, #{ count := Count } } = lists:keyfind(Name, 1, Inst),
+    {Name, Count, _} = lists:keyfind(Name, 1, Inst),
     Count.
-
-fuse_period(Name, #state { installed = Is }) ->
-    {_, #{ period := Period }} = lists:keyfind(Name, 1, Is),
-    Period.
 
 count_state(N) when N < 0 -> blown;
 count_state(_N) -> ok.
@@ -649,14 +626,12 @@ count_state(_N) -> ok.
 count_melts(Name, #state { melts = Ms }) ->
     length([N || {N, _} <- Ms, N == Name]).
 
+period(Name, #state { installed = Is }) ->
+    {_, _, Period} = lists:keyfind(Name, 1, Is),
+    Period.
 
 has_fuses_installed(#state { installed = [] }) -> false;
 has_fuses_installed(#state { installed = [_|_]}) -> true.
-
-parse_opts({{standard, C, P},{reset, R}}) ->
-    #{ fuse_type => standard, count => C, period => P, reset => R };
-parse_opts({{fault_injection, Rate, C, P}, {reset, Reset}}) ->
-    #{ fuse_type => fault_injection, rate => Rate, count => C, period => P, reset => Reset }.
 
 record_melt(Name, Ts, #state { melts = Ms } = S) ->
     S#state { melts = [{Name, Ts} | Ms] }.
@@ -698,6 +673,54 @@ remove_disabled(Name, #state { disabled = Ds } = State) ->
 %% Alternative implementation of being inside the period, based on microsecond conversion.
 in_period(Ts, Now, _) when Now < Ts -> false;
 in_period(Ts, Now, Period) when Now >= Ts -> (Now - Ts) < Period.
+
+t(seq, {T, Unit}) ->
+    eqc:testing_time(eval_time(T, Unit), prop_model_seq());
+t(seq, N) when is_integer(N) ->
+    eqc:numtests(N, prop_model_seq());
+t(par, {T, Unit}) ->
+    eqc:testing_time(eval_time(T, Unit), prop_model_par());
+t(par, N) when is_integer(N) ->
+    eqc:numtests(N, prop_model_par());
+t(pulse, {T, Unit}) ->
+    eqc:testing_time(eval_time(T, Unit), x_prop_model_pulse());
+t(pulse, N) when is_integer(N) ->
+    eqc:numtests(N, x_prop_model_pulse()).
+
+
+eval_time(N, h)   -> eval_time(N*60, min);
+eval_time(N, min) -> eval_time(N*60, sec);
+eval_time(N, sec) -> N.
+
+r(What, T) ->
+    eqc:quickcheck(t(What, T)).
+
+rv(What, T) ->
+    eqc:quickcheck(eqc_statem:show_states(t(What, T))).
+
+pulse_instrument() ->
+  [ pulse_instrument(File) || File <- filelib:wildcard("../src/*.erl") ++ filelib:wildcard("../eqc_test/*.erl") ],
+  load_sasl().
+
+load_sasl() ->
+  application:load(sasl),
+  application:set_env(sasl, sasl_error_logger, false),
+  application:set_env(sasl, errlog_type, error),
+  application:start(sasl),
+  ok.
+
+pulse_instrument(File) ->
+    EffectFul = [
+    	{ets, '_', '_'},
+    	{alarm_handler, '_', '_'}],
+    io:format("Compiling: ~p~n", [File]),
+    {ok, Mod} = compile:file(File, [{d, 'PULSE', true}, {d, 'WITH_PULSE', true},
+                                    {d, 'EQC_TESTING', true},
+                                    {parse_transform, pulse_instrument},
+                                    {pulse_side_effect, EffectFul}]),
+  code:purge(Mod),
+  code:load_file(Mod),
+  Mod.
 
 %% A little monad action:
 bind(M, F) ->
